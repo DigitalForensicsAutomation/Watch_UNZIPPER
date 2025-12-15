@@ -1,0 +1,294 @@
+# ============================================
+# Archive Monitor & Auto-Extractor
+# Monitors folder for .001 split archives and extracts them automatically
+# ============================================
+
+#Requires -Version 5.1
+
+# === CONFIGURATION ===
+$sourceFolder      = "C:\Transfer\Target"        # Folder with .001/.002 split archives
+$extractFolder     = "C:\Transfer\TempExtract"   # Temporary extraction folder
+$finalFolder       = "C:\Transfer\Completed"     # Final folder for extracted files
+$sevenZipPath      = "C:\Program Files\7-Zip\7z.exe"  # Path to 7-Zip executable
+$pollInterval      = 30                           # Time in seconds between folder scans
+$stableWaitTime    = 5                            # Seconds to wait for file stability
+$maxRetries        = 3                            # Max extraction retry attempts
+$logFile           = Join-Path $sourceFolder "archive_monitor.log"
+
+# === VALIDATE CONFIGURATION ===
+if (-not (Test-Path $sevenZipPath)) {
+    Write-Error "7-Zip not found at: $sevenZipPath"
+    exit 1
+}
+
+# Ensure required folders exist
+$foldersToCheck = @($extractFolder, $finalFolder, "$sourceFolder\Processed", "$sourceFolder\Failed")
+foreach ($f in $foldersToCheck) { 
+    if (-not (Test-Path $f)) { 
+        New-Item -ItemType Directory -Path $f -Force | Out-Null 
+        Write-Log "Created folder: $f"
+    } 
+}
+
+# === FUNCTION: Write to log file and console ===
+function Write-Log {
+    param(
+        [string]$message,
+        [ValidateSet('Info','Warning','Error','Success')]
+        [string]$level = 'Info'
+    )
+    
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logMessage = "[$timestamp] [$level] $message"
+    
+    # Console output with colors
+    switch ($level) {
+        'Error'   { Write-Host $logMessage -ForegroundColor Red }
+        'Warning' { Write-Host $logMessage -ForegroundColor Yellow }
+        'Success' { Write-Host $logMessage -ForegroundColor Green }
+        default   { Write-Host $logMessage }
+    }
+    
+    # File output
+    Add-Content -Path $logFile -Value $logMessage
+}
+
+# === FUNCTION: Check if file is locked or still being written ===
+function Test-FileLocked {
+    param([string]$file)
+    
+    if (-not (Test-Path $file)) { return $true }
+    
+    try {
+        $stream = [System.IO.File]::Open($file, 'Open', 'ReadWrite', 'None')
+        if ($stream) { 
+            $stream.Close()
+            return $false 
+        }
+    } catch {
+        return $true
+    }
+    return $true
+}
+
+# === FUNCTION: Wait for file to be stable (not growing) ===
+function Wait-FileStable {
+    param(
+        [string]$file,
+        [int]$waitSeconds = 5
+    )
+    
+    if (-not (Test-Path $file)) { return $false }
+    
+    $initialSize = (Get-Item $file).Length
+    Start-Sleep -Seconds $waitSeconds
+    
+    if (-not (Test-Path $file)) { return $false }
+    
+    $finalSize = (Get-Item $file).Length
+    return ($initialSize -eq $finalSize)
+}
+
+# === FUNCTION: Check if all split parts exist ===
+function Test-AllPartsExist {
+    param([string]$firstPartPath)
+    
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($firstPartPath)
+    $directory = [System.IO.Path]::GetDirectoryName($firstPartPath)
+    
+    # Check for common split patterns: .001, .002... or .part1, .part2...
+    $partNumber = 1
+    $currentPart = $firstPartPath
+    
+    while (Test-Path $currentPart) {
+        if (Test-FileLocked $currentPart) {
+            Write-Log "Part still locked: $currentPart" -level Warning
+            return $false
+        }
+        
+        $partNumber++
+        $currentPart = Join-Path $directory "$baseName.$('{0:D3}' -f $partNumber)"
+    }
+    
+    return $true
+}
+
+# === FUNCTION: Get archive size ===
+function Get-ArchiveSize {
+    param([string]$firstPartPath)
+    
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($firstPartPath)
+    $directory = [System.IO.Path]::GetDirectoryName($firstPartPath)
+    
+    $totalSize = 0
+    $partNumber = 1
+    $currentPart = Join-Path $directory "$baseName.$('{0:D3}' -f $partNumber)"
+    
+    while (Test-Path $currentPart) {
+        $totalSize += (Get-Item $currentPart).Length
+        $partNumber++
+        $currentPart = Join-Path $directory "$baseName.$('{0:D3}' -f $partNumber)"
+    }
+    
+    return [math]::Round($totalSize / 1MB, 2)
+}
+
+# === FUNCTION: Move all archive parts ===
+function Move-ArchiveParts {
+    param(
+        [string]$firstPartPath,
+        [string]$destinationFolder
+    )
+    
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($firstPartPath)
+    $directory = [System.IO.Path]::GetDirectoryName($firstPartPath)
+    
+    $partNumber = 1
+    $currentPart = Join-Path $directory "$baseName.$('{0:D3}' -f $partNumber)"
+    
+    while (Test-Path $currentPart) {
+        $fileName = [System.IO.Path]::GetFileName($currentPart)
+        $destination = Join-Path $destinationFolder $fileName
+        
+        Move-Item -Path $currentPart -Destination $destination -Force
+        
+        $partNumber++
+        $currentPart = Join-Path $directory "$baseName.$('{0:D3}' -f $partNumber)"
+    }
+}
+
+# === FUNCTION: Process Archives ===
+function Process-Archives {
+    $archives = Get-ChildItem -Path $sourceFolder -Filter "*.001" -File | Sort-Object LastWriteTime
+
+    if ($archives.Count -eq 0) { return }
+    
+    Write-Log "Found $($archives.Count) archive(s) to process"
+
+    foreach ($archive in $archives) {
+        $archivePath = $archive.FullName
+        $archiveName = [System.IO.Path]::GetFileNameWithoutExtension($archive.Name)
+        
+        Write-Log "Processing: $archiveName"
+
+        # Check if file is locked
+        if (Test-FileLocked $archivePath) {
+            Write-Log "File is locked, skipping: $archiveName" -level Warning
+            continue
+        }
+
+        # Wait for file stability
+        Write-Log "Checking file stability..."
+        if (-not (Wait-FileStable $archivePath $stableWaitTime)) {
+            Write-Log "File still growing, skipping: $archiveName" -level Warning
+            continue
+        }
+
+        # Check if all parts exist
+        if (-not (Test-AllPartsExist $archivePath)) {
+            Write-Log "Not all parts available or locked, skipping: $archiveName" -level Warning
+            continue
+        }
+
+        # Get archive size
+        $sizeMB = Get-ArchiveSize $archivePath
+        Write-Log "Archive size: ${sizeMB} MB"
+
+        # Extract to temp folder
+        $extractTarget = Join-Path $extractFolder $archiveName
+        if (Test-Path $extractTarget) { 
+            Remove-Item -Path $extractTarget -Recurse -Force 
+        }
+        New-Item -ItemType Directory -Path $extractTarget -Force | Out-Null
+
+        # Attempt extraction with retries
+        $extractSuccess = $false
+        for ($retry = 1; $retry -le $maxRetries; $retry++) {
+            if ($retry -gt 1) {
+                Write-Log "Retry attempt $retry of $maxRetries" -level Warning
+                Start-Sleep -Seconds 3
+            }
+
+            Write-Log "Extracting archive (attempt $retry)..."
+            & "$sevenZipPath" x "$archivePath" -o"$extractTarget" -y 2>&1 | Out-Null
+
+            if ($LASTEXITCODE -eq 0) {
+                $extractSuccess = $true
+                break
+            }
+        }
+
+        if ($extractSuccess) {
+            Write-Log "Extraction successful!" -level Success
+
+            # Count extracted files
+            $extractedFiles = Get-ChildItem -Path $extractTarget -Recurse -File
+            Write-Log "Extracted $($extractedFiles.Count) file(s)"
+
+            # Move extracted files to final folder
+            $duplicateCount = 0
+            foreach ($file in $extractedFiles) {
+                $relativePath = $file.FullName.Substring($extractTarget.Length).TrimStart('\')
+                $destination = Join-Path $finalFolder $relativePath
+
+                $destDir = Split-Path $destination
+                if (-not (Test-Path $destDir)) { 
+                    New-Item -ItemType Directory -Path $destDir -Force | Out-Null 
+                }
+
+                if (Test-Path $destination) {
+                    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+                    $newName = "$timestamp`_$($file.Name)"
+                    $destination = Join-Path $destDir $newName
+                    $duplicateCount++
+                }
+
+                Move-Item -Path $file.FullName -Destination $destination -Force
+            }
+
+            if ($duplicateCount -gt 0) {
+                Write-Log "Renamed $duplicateCount duplicate file(s)" -level Warning
+            }
+
+            # Clean up temp folder
+            Remove-Item -Path $extractTarget -Recurse -Force
+
+            # Move all archive parts to Processed
+            Move-ArchiveParts -firstPartPath $archivePath -destinationFolder "$sourceFolder\Processed"
+            Write-Log "Moved archive parts to Processed folder" -level Success
+            
+        } else {
+            Write-Log "Extraction failed after $maxRetries attempts" -level Error
+            
+            # Clean up failed extraction
+            if (Test-Path $extractTarget) {
+                Remove-Item -Path $extractTarget -Recurse -Force
+            }
+            
+            # Move all archive parts to Failed
+            Move-ArchiveParts -firstPartPath $archivePath -destinationFolder "$sourceFolder\Failed"
+            Write-Log "Moved archive parts to Failed folder" -level Error
+        }
+        
+        Write-Log "----------------------------------------"
+    }
+}
+
+# === MAIN WATCH LOOP ===
+Write-Log "========================================" -level Success
+Write-Log "Archive Monitor Started" -level Success
+Write-Log "Source: $sourceFolder" -level Success
+Write-Log "Destination: $finalFolder" -level Success
+Write-Log "Poll Interval: $pollInterval seconds" -level Success
+Write-Log "========================================" -level Success
+
+while ($true) {
+    try {
+        Process-Archives
+    } catch {
+        Write-Log "ERROR: $($_.Exception.Message)" -level Error
+        Write-Log "Stack Trace: $($_.ScriptStackTrace)" -level Error
+    }
+
+    Start-Sleep -Seconds $pollInterval
+}
